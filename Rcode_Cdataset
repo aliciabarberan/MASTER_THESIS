@@ -1,0 +1,373 @@
+library(zellkonverter)  #to convert data to SingleCellExpression object
+library(SingleCellExperiment)
+library(robustbase)  # QC
+library(scuttle)
+library(scater)  #Visualization QC
+library(scran)  #Deconvolution normalization + feature selection + PCA
+library(viridis)
+library(PCAtools)
+library(reshape2)
+library(readxl)
+library(dplyr)
+library(gridExtra)
+library(edgeR)
+library(BiocParallel)
+library(ggpubr)
+library(rstatix)
+
+h5adfile <- "data.h5ad"
+sce <- readH5AD(h5adfile, use_hdf5=TRUE)
+identical(rownames(colData(sce)), colnames(assays(sce)$X)) # Check consistency of colData
+identical(rownames(rowData(sce)), rownames(assays(sce)$X)) # Check consistency fo rowData
+
+#qc
+assays(sce)$counts <- assays(sce)$X 
+assays(sce)$X <- NULL
+
+sce <- addPerCellQCMetrics(sce, subsets=list(Mito=is.mito))
+
+colData <- colData(sce)
+stats <- cbind(log10(colData$detected), log10(colData$sum), colData$subsets_Mito_percent)
+outlying <- adjOutlyingness(stats, only.outlyingness=TRUE)
+multi.outlier <- isOutlier(outlying, type="higher")
+colData(sce) <- cbind(colData(sce), discard)
+
+pdf("QC_robustbase_log.pdf")
+plotColData(sce, x = "Celltype", y = "sum", colour_by="discard") + scale_y_log10() + ggtitle("Total count")
+plotColData(sce, x = "Celltype", y = "detected", colour_by = "discard") + scale_y_log10() + ggtitle("Detected genes")
+plotColData(sce, x = "Celltype", y = "subsets_Mito_percent", colour_by = "discard") + ggtitle("Mitocondrial percentage")
+dev.off()
+
+sce.qc <- sce[, !discard]
+
+#Nomalisation
+set.seed(100)
+clust.sce <- quickCluster(sce.qc)
+sce.qc <- computeSumFactors(sce.qc, cluster = clust.sce, min.mean = 0.1)
+sce.qc <- logNormCounts(sce.qc)
+param <- MulticoreParam(workers = 8,
+                        reduceStep = 1L)
+
+#Variability
+param_serial <- SerialParam()
+sce.qc$DonorID <- as.factor(as.vector(sce.qc$DonorID))  
+
+set.seed(100)
+dec.pois <- modelGeneVarByPoisson(sce.qc, 
+                                  block = sce.qc$DonorID,
+                                  equiweight=FALSE,
+                                  BPPARAM=param_serial)
+
+dec.pois.qc <- dec.pois[!is.na(dec.pois$p.value), ]
+
+# Selecting biologically variable genes
+index <- which(dec.pois.qc$p.value <= 0.05 & dec.pois.qc$FDR <= 0.05)
+dec.pois.qc2 <- dec.pois.qc[index,]
+inters <- intersect(rownames(dec.pois.qc2), rownames(sce.qc))
+sce.vg<- sce.qc[inters,]
+
+#PCA
+set.seed(100)
+sce.vg <- runPCA(sce.vg, assay.type = "logcounts")
+percent.var <- attr(reducedDim(sce.vg, "PCA"), "percentVar")
+chosen.elbow <- findElbowPoint(percent.var)
+
+pdf("variancePCAs.pdf")
+plot(percent.var, xlab="PC", ylab="Variance explained (%)")
+abline(v=chosen.elbow, col="red")
+dev.off()
+reducedDim(sce.vg, "PCA.elbow") <- reducedDim(sce.vg, "PCA")[,1:chosen.elbow]
+
+pdf("PCA.pdf")
+plotReducedDim(sce.vg, dimred = "PCA.elbow", colour_by="group")
+dev.off()
+
+# UMAP
+set.seed(100)
+sce.vg <- runUMAP(sce.vg, dimred = "PCA.elbow", metric = "correlation", n_neighbors = 90, min_dist = 0.3)
+
+umap_df <- data.frame(
+  UMAP1 = reducedDim(sce.vg, "UMAP")[,1],
+  UMAP2 = reducedDim(sce.vg, "UMAP")[,2],
+  celltype = colData(sce.vg)$group)
+
+label_positions <- umap_df %>%
+  group_by(celltype) %>%
+  summarize(
+    x = median(UMAP1),
+    y = median(UMAP2),
+    .groups = "drop"
+  )
+
+pdf("UMAP.pdf")
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = celltype)) +
+  geom_point(size = 0.2, alpha = 0.7) +
+  geom_text(data = label_positions, aes(x = x, y = y, label = celltype),
+            color = "black", size = 3) +
+  theme_minimal() +
+  labs(title = "UMAP with Cell Types") +
+  dev.off()
+
+# plots
+excel <- read_excel("GenesEscapeXCI.xlsx", skip=1)
+inactive <- excel$Gene.name[excel$Combined.XCI.status=="inactive"]
+escape <- excel$Gene.name[excel$Combined.XCI.status=="escape"]
+
+ina <- intersect(rowData(sce.vg)$X_index, inactive)
+inac <- which(rowData(sce.vg)$X_index %in% ina)
+esc <- intersect(rowData(sce.vg)$X_index, escape)
+esc <- esc[esc !="XIST"]
+esca <- which(rowData(sce.vg)$X_index %in% esc)
+
+mean_ina <- colMeans(assays(sce.vg)$logcounts[inac, ], na.rm=TRUE)
+mean_esc <- colMeans(assays(sce.vg)$logcounts[esca, ], na.rm=TRUE)
+
+colData(sce.vg)$inactive_vs_escape <- log2(mean_ina / mean_esc)
+colData(sce.vg)$mean_inactive <- mean_ina
+colData(sce.vg)$mean_escape <- mean_esc
+
+cell_counts <- table(colData(sce.vg)$Period)
+cell_types_10X <- names(cell_counts[cell_counts > 1])
+mean_cells <- c()
+for (cell in cell_types_10X){
+  cells <- which(sce.vg$Period == cell & sce.vg$inactive_vs_escape != Inf)
+  mean_cells <- c(mean_cells, median(colData(sce.vg[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+mean_cells <- data.frame(
+  celula = cell_types_10X,
+  valor = mean_cells)
+
+mean_cells_ordenado <- mean_cells[order(mean_cells$valor), ]
+order <- mean_cells_ordenado$celula
+order_s <- c("Proliferative", "Secretory", "Early_pregnancy", "Late_pregnancy")
+
+df <- colData(sce.vg) %>%
+  as.data.frame() %>%
+  dplyr::mutate(ive=inactive_vs_escape) %>%
+  dplyr::filter(is.finite(ive))
+
+sce.sub <- sce.vg[, rownames(df)]
+
+levels_grp <- unique(colData(sce.sub)$Period)
+comparisons <- combn(levels_grp, 2, simplify = FALSE)
+stat_compare_means(comparisons = comparisons,
+                   method = "t.test",
+                   label = "p.format",
+                   step.increase = 0.05) +
+  
+pdf("SiXGD_period.pdf")
+ggcells(sce.sub, mapping = aes(x = Period, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=Period)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order_s) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+    labs(title = "Genes expression per cell type", x = "Period", 
+       y = "Log2 proportion of silenced/escaped")
+dev.off()
+
+NK <- c("NK1", "NK2", "NK3", "NKp", "NKT")
+ILC <- c("ILC3")
+Myeloid_cells <- c("Mac1", "Mac2", "Mac3", "MO", "Mpro", "cDC1", "pDC", "HB", "Granulocyte", "M1", "M2", "M3")
+T_cells <- c("T-CD4", "T-CD8", "Teff", "Tex", "Tnaive", "Tpro", "Treg", "MAIT")
+Plasma <- c("Plasma")
+Stromal_cells <- c("eS")
+Decidual_cells <- c("dS1", "dS2", "dS3", "dS-FERMT1", "dS-SCGB2A1", "dS-SFRP4", "dS-SLPI")
+Perivascular <- c("PV-MYH1", "PV-STEAP4")
+Epithelial <- c("Epi-Cilla", "Epi-Glandular", "Epi-Lumenal", "Epi-SOX9")
+Endothelial <- c("Endo")
+Fibroblasts <- c("Fibro-C7", "Fibro-GJA1", "Fibro-ERRFI1")
+uSMCs <- c("uSMC")
+Trophoblasts <- c("EVT", "VCT", "SCT")
+
+sce.vg$group <- ifelse(sce.vg$Celltype %in% NK, "NK",
+                ifelse(sce.vg$Celltype %in% ILC, "ILC",
+                ifelse(sce.vg$Celltype %in% Myeloid_cells, "Myeloid_cells",
+                ifelse(sce.vg$Celltype %in% T_cells, "T_cells",
+                ifelse(sce.vg$Celltype %in% Plasma, "Plasma",
+                ifelse(sce.vg$Celltype %in% Stromal_cells, "Stromal_cells",
+                ifelse(sce.vg$Celltype %in% Decidual_cells, "Decidual_cells",
+                ifelse(sce.vg$Celltype %in% Perivascular, "Perivascular",
+                ifelse(sce.vg$Celltype %in% Epithelial, "Epithelial",
+                ifelse(sce.vg$Celltype %in% Endothelial, "Endothelial",
+                ifelse(sce.vg$Celltype %in% Fibroblasts, "Fibroblasts",
+                ifelse(sce.vg$Celltype %in% uSMCs, "uSMCs",
+                ifelse(sce.vg$Celltype %in% Trophoblasts, "Trophoblasts", "Other")))))))))))))
+
+index <- which(colData(sce.vg)$group != "Fibroblasts" &
+                 colData(sce.vg)$group != "Trophoblasts" &
+                 colData(sce.vg)$group != "Other")
+sce.vg <- sce.vg[,index]
+
+Immune <- c("NK", "ILC", "Myeloid_cells", "T_cells", "Plasma")
+Decidual_stromal <- c("Stromal_cells", "Decidual_cells")
+Perivascular <- c("Perivascular")
+Endothelial <- c("Endothelial")
+Epithelial <- c("Epithelial")
+uSMCs <- c("uSMCs")
+
+sce.vg$group_2 <- ifelse(sce.vg$group %in% Immune, "Immune",
+                         ifelse(sce.vg$group %in% Decidual_stromal, "Mesenchymal",
+                                ifelse(sce.vg$group %in% Perivascular, "Perivascular",
+                                       ifelse(sce.vg$group %in% Endothelial, "Endothelial",
+                                              ifelse(sce.vg$group %in% Epithelial, "Epithelial",
+                                                     ifelse(sce.vg$group %in% uSMCs, "uSMCs","Other"))))))
+
+index <- which(colData(sce.vg)$group == "Stromal_cells")
+index2 <- which(colData(sce.vg)$group == "Decidual_cells")
+sce.vg.stromal <- sce.vg[,index]
+sce.vg.decidual <- sce.vg[,index2]
+
+cell_counts <- table(colData(sce.vg)$group_2)
+cell_types_10X <- names(cell_counts[cell_counts > 1])
+mean_cells <- c()
+for (cell in cell_types_10X){
+  cells <- which(sce.vg$group_2 == cell & sce.vg$inactive_vs_escape != Inf)
+  mean_cells <- c(mean_cells, median(colData(sce.vg[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+mean_cells <- data.frame(
+  celula = cell_types_10X,
+  valor = mean_cells)
+
+mean_cells_ordenado <- mean_cells[order(mean_cells$valor), ]
+order <- mean_cells_ordenado$celula
+
+pdf("SiXGD.pdf")
+ggcells(sce.vg, mapping = aes(x = group, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=group)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Genes expression per cell type", x = "Cell_group", 
+       y = "Log2 proportion of silenced/escaped")
+ggcells(sce.vg, mapping = aes(x = group, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=group)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Genes expression per cell type", x = "Cell_group", 
+       y = "Log2 proportion of silenced/escaped")+
+  facet_wrap(~ Period)
+dev.off()
+
+pdf("SiXGD_celltype_period.pdf")
+ggcells(sce.vg, mapping = aes(x = group_2, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=group_2)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") +
+  labs(title = "Genes expression per cell type", x = "Cell_group", 
+       y = "Log2 proportion of silenced/escaped")
+ggcells(sce.vg, mapping = aes(x = group_2, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=group_2)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Genes expression per cell type", x = "Cell_group", 
+       y = "Log2 proportion of silenced/escaped")+
+  facet_wrap(~ Period)
+dev.off()
+
+ina_esc <- colData(sce.vg)$inactive_vs_escape
+cell_types <- colData(sce.vg)$group
+result <- pairwise.wilcox.test(ina_esc, cell_types, p.adjust.method = "bonferroni")
+
+df <- colData(sce.vg.stromal) %>%
+  as.data.frame() %>%
+  dplyr::mutate(ive=inactive_vs_escape) %>%
+  dplyr::filter(is.finite(ive))
+df.d <- colData(sce.vg.decidual) %>%
+  as.data.frame() %>%
+  dplyr::mutate(ive=inactive_vs_escape) %>%
+  dplyr::filter(is.finite(ive))
+
+sce.sub.stromal <- sce.vg.stromal[, rownames(df)]
+sce.sub.decidual <- sce.vg.decidual[,rownames(df.d)]
+
+levels_grp_s <- unique(colData(sce.sub.stromal)$Period)
+levels_grp_d <- unique(colData(sce.sub.decidual)$Period)
+comparisons_s <- combn(levels_grp_s, 2, simplify = FALSE)
+comparisons_d <- combn(levels_grp_d, 2, simplify = FALSE)
+
+colData(sce.vg)$xist <- assays(sce.vg)$logcounts[grep("XIST", rowData(sce.vg)$X_index), ]
+colData(sce.sub.decidual)$xist <- assays(sce.sub.decidual)$logcounts[grep("XIST", rowData(sce.sub.decidual)$X_index), ]
+colData(sce.sub.stromal)$xist <- assays(sce.sub.stromal)$logcounts[grep("XIST", rowData(sce.sub.stromal)$X_index), ]
+
+pdf("xist.pdf")
+ggcells(sce.vg, mapping = aes(x = group, y = xist)) +
+  geom_violin(aes(colour=group)) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  stat_summary(fun = mean, geom = "point", shape = 23)+
+  labs(title = "Gene expression per cell type", x = "Cell_group", 
+       y = "XIST")
+ggcells(sce.vg, mapping = aes(x = group, y = xist)) +
+  geom_violin(aes(colour=group)) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Gene expression per cell type", x = "Cell_group", 
+       y = "XIST")+
+  facet_wrap(~ Period)
+ggcells(sce.vg, mapping = aes(x = Period, y = xist)) +
+  geom_violin(aes(colour=Period)) +
+  scale_x_discrete(limits = order_s) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Gene expression per cell type", x = "Period", 
+       y = "XIST")
+ggcells(sce.sub.stromal, mapping = aes(x = Period, y = xist)) +
+  geom_violin(aes(colour=Period)) +
+  scale_x_discrete(limits = order_s) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  stat_summary(fun = mean, geom = "point", shape = 23)+
+  stat_compare_means(comparisons = comparisons_s,
+                     method = "t.test",
+                     label = "p.signif",
+                     step.increase = 0.05) +
+  labs(title = "Xist expression in stromal cells", x = "Period", 
+       y = "XIST")
+ggcells(sce.sub.stromal, mapping = aes(x = Period, y = xist)) +
+  geom_violin(aes(colour=Period)) +
+  scale_x_discrete(limits = order_s) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  stat_summary(fun = mean, geom = "point", shape = 23)+
+  stat_compare_means(comparisons = comparisons_s,
+                     method = "t.test",
+                     label = "p.format",
+                     step.increase = 0.05) +
+  labs(title = "Xist expression in stromal cells", x = "Period", 
+       y = "XIST")
+dev.off()
