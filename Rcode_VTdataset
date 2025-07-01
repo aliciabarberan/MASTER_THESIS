@@ -1,0 +1,531 @@
+#Packages
+library(zellkonverter)  #to convert data to SingleCellExpression object
+library(SingleCellExperiment)
+library(robustbase)  # QC
+library(scuttle)
+library(scater)  #Visualization QC
+library(scran)  #Deconvolution normalization + feature selection + PCA
+library(viridis)
+library(PCAtools)
+library(reshape2)
+library(readxl)
+library(dplyr)
+library(gridExtra)
+
+#Dataset
+h5adfile <- "data.h5ad"
+sce <- readH5AD(h5adfile, use_hdf5=TRUE)
+identical(rownames(colData(sce)), colnames(assays(sce)$X)) # Check consistency of colData
+identical(rownames(rowData(sce)), rownames(assays(sce)$X)) # Check consistency fo rowData
+
+#Separating datasets
+index.smart2 <- which(colData(sce)$assay == "Smart-seq2")
+sce.smart2 <- sce[,index.smart2]
+index.10X <- which(colData(sce)$assay == "10x 3' v2")
+sce.10X <- sce[, index.10X]
+
+#Quality control with robustbase
+colData.smart2 <- colData(sce.smart2)
+summary(colData.smart2$percent.mito)
+summary(colData.smart2$nGene)
+summary(colData.smart2$nUMI)
+
+stats.smart2 <- cbind(log10(colData.smart2$nGene), log10(colData.smart2$nUMI), colData.smart2$percent.mito)
+outlying.smart2 <- adjOutlyingness(stats.smart2, only.outlyingness=TRUE)
+multi.outlier.smart2 <- isOutlier(outlying.smart2, type="higher")
+low.outlier.smart2 <- isOutlier(outlying.smart2, type="lower")
+summary(multi.outlier.smart2)
+discard.smart2 <- multi.outlier.smart2
+colData(sce.smart2) <- cbind(colData(sce.smart2), discard.smart2)
+
+colData(sce.smart2)$cell_type <- case_when(
+  colData(sce.smart2)$cell_type == "T cell" ~ "T lymphocyte",
+  colData(sce.smart2)$cell_type == "granulocyte" ~ "Granulocyte",
+  colData(sce.smart2)$cell_type == "endothelial cell" ~ "Endothelial cell",
+  colData(sce.smart2)$cell_type == "glandular epithelial cell" ~ "Glandular epithelial cell",
+  colData(sce.smart2)$cell_type == "macrophage" ~ "Macrophage",
+  colData(sce.smart2)$cell_type == "monocyte" ~ "Monocyte",
+  colData(sce.smart2)$cell_type == "pericyte" ~ "Pericyte",
+  colData(sce.smart2)$cell_type == "plasma cell" ~ "Plasma cell",
+  colData(sce.smart2)$cell_type == "CD16-negative, CD56-bright natural killer cell, human" ~ "CD16-negative, CD56-bright natural killer cell",
+  colData(sce.smart2)$cell_type == "CD16-positive, CD56-dim natural killer cell, human" ~ "CD16-positive, CD56-dim natural killer cell",
+  colData(sce.smart2)$cell_type == "conventional dendritic cell" ~ "Conventional dendritic cell",
+  colData(sce.smart2)$cell_type == "innate lymphoid cell" ~ "Innate lymphoid cell",
+  colData(sce.smart2)$cell_type == "decidual natural killer cell, human" ~ "Decidual natural killer cell",
+  colData(sce.smart2)$cell_type == "fibroblast" ~ "Fibroblast",
+  colData(sce.smart2)$cell_type == "syncytiotrophoblast cel" ~ "Syncytiotrophoblast cel",
+  colData(sce.smart2)$cell_type == "decidual cell" ~ "Decidual cell",
+  colData(sce.smart2)$cell_type == "extravillous trophoblast" ~ "Extravillous trophoblast",
+  colData(sce.smart2)$cell_type == "placental villous trophoblast" ~ "Placental villous trophoblast",
+  TRUE ~ as.character(colData(sce.smart2)$cell_type)
+)
+
+pdf("QC_robustbase_smart2.pdf")
+plotColData(sce.smart2, x = "cell_type", y = "nUMI", colour_by="discard.smart2") +
+  scale_y_log10() + 
+  ggtitle("Log10 of total UMIs per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  labs(x = "Cell type", subtitle = "Sequencing technique: Smart-seq2")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.smart2, x = "cell_type", y = "nGene", colour_by = "discard.smart2") + 
+  scale_y_log10() + 
+  ggtitle("Log10 of detected genes per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  labs(x = "Cell type", subtitle = "Sequencing technique: Smart-seq2")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.smart2, x = "cell_type", y = "percent.mito", colour_by = "discard.smart2") + 
+  ggtitle("Mitochondrial genes percentage per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11)) +
+  labs(y = "Mitochondrial genes percentage", x = "Cell type", subtitle = "Sequencing technique: Smart-seq2")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.smart2, x = "nUMI", y = "percent.mito", colour_by = "discard.smart2") +
+  labs(y = "Mitochondrial genes percentage", subtitle = "Sequencing technique: Smart-seq2", title = "nUMIs and Mitochondrial genes percentage") +
+  theme(axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  scale_color_discrete(name = "QC discard")
+dev.off()
+
+sce.smart2.qc <- sce.smart2[, !discard.smart2]
+
+colData.10X <- colData(sce.10X)
+summary(colData.10X$percent.mito)
+summary(colData.10X$nGene)
+summary(colData.10X$nUMI)
+
+stats.10X <- cbind(log10(colData.10X$nGene), log10(colData.10X$nUMI), colData.10X$percent.mito)
+outlying.10X <- adjOutlyingness(stats.10X, only.outlyingness=TRUE)
+multi.outlier.10X <- isOutlier(outlying.10X, type="higher")
+low.outlier.10X <- isOutlier(outlying.10X, type="lower")
+summary(multi.outlier.10X)
+discard.10X <- multi.outlier.10X
+summary(low.outlier.10X)  # No hay
+colData(sce.10X) <- cbind(colData(sce.10X), discard.10X)
+
+colData(sce.10X)$cell_type <- case_when(
+  colData(sce.10X)$cell_type == "T cell" ~ "T lymphocyte",
+  colData(sce.10X)$cell_type == "granulocyte" ~ "Granulocyte",
+  colData(sce.10X)$cell_type == "endothelial cell" ~ "Endothelial cell",
+  colData(sce.10X)$cell_type == "glandular epithelial cell" ~ "Glandular epithelial cell",
+  colData(sce.10X)$cell_type == "macrophage" ~ "Macrophage",
+  colData(sce.10X)$cell_type == "monocyte" ~ "Monocyte",
+  colData(sce.10X)$cell_type == "pericyte" ~ "Pericyte",
+  colData(sce.10X)$cell_type == "plasma cell" ~ "Plasma cell",
+  colData(sce.10X)$cell_type == "CD16-negative, CD56-bright natural killer cell, human" ~ "CD16-negative, CD56-bright natural killer cell",
+  colData(sce.10X)$cell_type == "CD16-positive, CD56-dim natural killer cell, human" ~ "CD16-positive, CD56-dim natural killer cell",
+  colData(sce.10X)$cell_type == "conventional dendritic cell" ~ "Conventional dendritic cell",
+  colData(sce.10X)$cell_type == "innate lymphoid cell" ~ "Innate lymphoid cell",
+  colData(sce.10X)$cell_type == "decidual natural killer cell, human" ~ "Decidual natural killer cell",
+  colData(sce.10X)$cell_type == "decidual cell" ~ "Decidual cell",
+  colData(sce.10X)$cell_type == "fibroblast" ~ "Fibroblast",
+  colData(sce.10X)$cell_type == "syncytiotrophoblast cel" ~ "Syncytiotrophoblast cell",
+  colData(sce.10X)$cell_type == "decidual cell" ~ "Decidual cell",
+  colData(sce.10X)$cell_type == "extravillous trophoblast" ~ "Extravillous trophoblast",
+  colData(sce.10X)$cell_type == "placental villous trophoblast" ~ "Placental villous trophoblast",
+  TRUE ~ as.character(colData(sce.10X)$cell_type)
+)
+
+pdf("QC_robustbase_10x.pdf")
+plotColData(sce.10X, x = "cell_type", y = "nUMI", colour_by="discard.10X") +
+  ggtitle("Total UMIs per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  labs(x = "Cell type", subtitle = "Sequencing technique: 10X Genomics")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.10X, x = "cell_type", y = "nGene", colour_by = "discard.10X") + 
+  ggtitle("Detected genes per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  labs(x = "Cell type", subtitle = "Sequencing technique: 10X Genomics")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.10X, x = "cell_type", y = "percent.mito", colour_by = "discard.10X") + 
+  ggtitle("Mitochondrial genes percentage per cell") +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11)) +
+  labs(y = "Mitochondrial genes percentage", x = "Cell type", subtitle = "Sequencing technique: 10X Genomics")+
+  scale_color_discrete(name = "QC discard")
+
+plotColData(sce.10X, x = "nUMI", y = "percent.mito", colour_by = "discard.10X") +
+  labs(y = "Mitochondrial genes percentage", subtitle = "Sequencing technique: 10X Genomics", title = "nUMIs and Mitochondrial genes percentage") +
+  theme(axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  scale_color_discrete(name = "QC discard")
+dev.off()
+
+sce.10X.qc <- sce.10X[, !discard.10X]
+
+#Normalization
+set.seed(100)
+clust.sce.smart2 <- quickCluster(sce.smart2.qc)
+deconv.sf.smart2 <- calculateSumFactors(sce.smart2.qc, cluster = clust.sce.smart2)
+sce.smart2.qc <- computeSumFactors(sce.smart2.qc, cluster = clust.sce.smart2, min.mean = 0.1)
+sce.smart2.qc <- logNormCounts(sce.smart2.qc)
+
+set.seed(100)
+clust.sce.10X <- quickCluster(sce.10X.qc)
+deconv.sf.10X <- calculateSumFactors(sce.10X.qc, cluster = clust.sce.10X)
+sce.10X.qc <- computeSumFactors(sce.10X.qc, cluster = clust.sce.10X, min.mean = 0.1)
+sce.10X.qc <- logNormCounts(sce.10X.qc)
+
+#Feature selection by deconvolution
+sce.10X.qc[, !(sce.10X.qc$donor_id %in% c("D1_mother", "D2_mother", "D3_mother", "D4_mother", "D5_mother"))]
+sce.10X.qc$donor_id <- as.factor(as.vector(sce.10X.qc$donor_id))
+
+set.seed(100)
+dec.pois.10X <- modelGeneVarByPoisson(sce.10X.qc, block = sce.10X.qc$donor_id, equiweight=FALSE)
+dec.pois.10X.qc <- dec.pois.10X[!is.na(dec.pois.10X$p.value), ] 
+
+sce.smart2.qc[, (sce.smart2.qc$donor_id %in% c("D1_mother", "D2_mother", "D3_mother", "D4_mother", "D5_mother"))]
+sce.smart2.qc$donor_id <- as.factor(as.vector(sce.smart2.qc$donor_id))
+
+set.seed(100)
+dec.pois.smart2 <- modelGeneVarByPoisson(sce.smart2.qc, block=sce.smart2.qc$donor_id, equiweight = FALSE)
+dec.pois.smart2.qc <- dec.pois.smart2[!is.na(dec.pois.smart2$p.value), ]
+
+index <- which(dec.pois.10X.qc$p.value <= 0.05 & dec.pois.10X.qc$FDR <= 0.05)
+dec.pois.10X.qc2 <- dec.pois.10X.qc[index,]
+inters <- intersect(rownames(dec.pois.10X.qc2), rownames(sce.10X.qc))
+sce.10X.vg<- sce.10X.qc[inters,]
+
+index <- which(dec.pois.smart2.qc$p.value <= 0.05 & dec.pois.smart2.qc$FDR <= 0.05)
+dec.pois.smart2.qc2 <- dec.pois.smart2.qc[index,]
+inters <- intersect(rownames(dec.pois.smart2.qc2), rownames(sce.smart2.qc))
+sce.smart2.vg <- sce.smart2.qc[inters,]
+
+#PCA
+set.seed(100)
+sce.10X.vg <- runPCA(sce.10X.vg, assay.type = "logcounts")
+percent.var <- attr(reducedDim(sce.10X.vg, "PCA"), "percentVar")
+chosen.elbow <- findElbowPoint(percent.var)
+reducedDim(sce.10X.vg, "PCA.elbow") <- reducedDim(sce.10X.vg, "PCA")[,1:chosen.elbow]
+
+#UMAP
+neighbors <- seq(10, 100, 10)
+dist <- seq(0.1, 1, 0.1)
+
+pdf("UMAP_correlation_combinations.pdf")
+for (i in neighbors){
+  for (j in dist){
+    set.seed(100)
+    sce.10X.vg <- runUMAP(sce.10X.vg, dimred = "PCA.elbow", 
+                          metric = "correlation",
+                          n_neighbors = i,
+                          min_dist = j)
+    umap_df <- data.frame(
+      UMAP1 = reducedDim(sce.10X.vg, "UMAP")[,1],
+      UMAP2 = reducedDim(sce.10X.vg, "UMAP")[,2],
+      celltype = colData(sce.10X.vg)$cell_type,
+      expression = as.numeric(assay(sce.10X.vg, "logcounts")["ENSG00000229807",]))
+    
+    p <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2)) +
+      geom_point(aes(color = celltype)) +
+      theme_minimal()
+    print(p)
+  }
+}
+dev.off()
+
+set.seed(100)
+sce.10X.vg <- runUMAP(sce.10X.vg, dimred = "PCA.elbow", metric = "correlation", n_neighbors = 90, min_dist = 0.3)
+
+immune_cells <- c("T lymphocyte", "Granulocyte", "Macrophage", "Monocyte", "Plasma cell", 
+                  "CD16-negative, CD56-bright natural killer cell",
+                  "CD16-positive, CD56-dim natural killer cell", "Conventional dendritic cell",
+                  "Innate lymphoid cell", "Decidual natural killer cell")
+cell_types <- as.character(colData(sce.10X.vg)$cell_type)
+colData(sce.10X.vg)$groups <- ifelse(colData(sce.10X.vg)$cell_type %in% immune_cells, "Immune system cells",
+                                     cell_types)
+umap_df <- data.frame(
+  UMAP1 = reducedDim(sce.10X.vg, "UMAP")[,1],
+  UMAP2 = reducedDim(sce.10X.vg, "UMAP")[,2],
+  celltype = colData(sce.10X.vg)$groups,
+  expression = as.numeric(assay(sce.10X.vg, "logcounts")["ENSG00000229807",]))
+
+label_positions <- umap_df %>%
+  group_by(celltype) %>%
+  summarize(
+    x = median(UMAP1),
+    y = median(UMAP2),
+    .groups = "drop"
+  )
+
+pdf("UMAP_XISTexpression.pdf")
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(colour = expression, alpha = expression), size = 0.5) +  # Añadir alpha basado en expression
+  geom_text(data = label_positions, aes(x = x, y = y, label = celltype),
+            color = "black", size = 3) +
+  scale_color_gradient(low = "lightgrey", high = "red", name = "ENSG00000229807") +
+  scale_alpha_continuous(range = c(0.1, 1), guide = "none") +  # Establecer el rango de alpha
+  theme_minimal() +
+  labs(title = "UMAP with XIST expression") +
+  theme(legend.position = "none")  # Eliminar la leyenda
+dev.off()
+
+pdf("UMAPcelltypes.pdf")
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = celltype)) +
+  geom_point(size = 0.2, alpha = 0.7) +
+  geom_text(data = label_positions, aes(x = x, y = y, label = celltype),
+            color = "black", size = 3) +
+  theme_minimal() +
+  labs(title = "UMAP with Cell Types") +
+  theme(legend.position = "none") 
+dev.off()
+
+# Expression plots (the same code was used for all genes)
+sce.10X.vg.qc <- sce.10X.vg[, grepl("mother", colData(sce.10X.vg)$donor_id)]
+index <- which((colData(sce.10X.vg.qc)$cell_type != "Syncytiotrophoblast cel") &
+                 (colData(sce.10X.vg.qc)$cell_type != "Extravillous trophoblast") &
+                 (colData(sce.10X.vg.qc)$cell_type != "Placental villous trophoblast") &
+                 (colData(sce.10X.vg.qc)$cell_type != "Hofbauer cell") &
+                 (colData(sce.10X.vg.qc)$cell_type != "Fibroblast"))
+sce.10X.vg.qc<- sce.10X.vg.qc[, index]
+
+index <- which((colData(sce.smart2.vg)$cell_type != "Syncytiotrophoblast cell") &
+                 (colData(sce.smart2.vg)$cell_type != "Extravillous trophoblast") &
+                 (colData(sce.smart2.vg)$cell_type != "Placental villous trophoblast") &
+                 (colData(sce.smart2.vg)$cell_type != "Hofbauer cell") &
+                 (colData(sce.smart2.vg)$cell_type != "Fibroblast"))
+sce.smart2.vg.qc<- sce.smart2.vg[, index]
+
+#XIST
+
+colData(sce.10X.vg.qc)$xist <- assays(sce.10X.vg.qc)$logcounts["ENSG00000229807", ]
+
+cell_counts <- table(colData(sce.10X.vg.qc)$cell_type)
+cell_types <- names(cell_counts[cell_counts > 1])
+median_cells <- c()
+for (cell in cell_types){
+  cells <- which(sce.10X.vg.qc$cell_type == cell & sce.10X.vg.qc$xist != Inf)
+  median_cells <- c(median_cells, median(colData(sce.10X.vg.qc[, cells])$xist, na.rm=TRUE))
+}
+
+df <- data.frame(
+  celula = cell_types,
+  median = median_cells
+)
+
+df_ordered <- df[order(df$median), ]
+order <- df_ordered$celula
+
+colData(sce.smart2.vg.qc)$xist <- assays(sce.smart2.vg.qc)$logcounts["ENSG00000229807", ]
+
+cell_counts_s <- table(colData(sce.smart2.vg.qc)$cell_type)
+cell_types_s <- names(cell_counts_s[cell_counts_s > 1])
+median_cells_s <- c()
+for (cell in cell_types_s){
+  cells_s <- which(sce.smart2.vg.qc$cell_type == cell & sce.smart2.vg.qc$xist != Inf)
+  median_cells_s <- c(median_cells_s, median(colData(sce.smart2.vg.qc[, cells_s])$xist, na.rm=TRUE))
+}
+
+df_s <- data.frame(
+  celula_s = cell_types_s,
+  median_s = median_cells_s
+)
+
+df_ordered_s <- df_s[order(df_s$median_s), ]
+order_s <- df_ordered_s$celula_s
+
+pdf("xist.pdf")
+ggcells(sce.10X.vg.qc, mapping=aes(x=cell_type, y=ENSG00000229807)) + 
+  geom_boxplot(aes(colour = cell_type)) +
+  theme_minimal() + 
+  ggtitle("10X Genomics data, XIST Expression") +
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 80, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none")+
+  coord_cartesian(ylim = c(0,3.3))
+ggcells(sce.smart2.vg.qc, mapping=aes(x=cell_type, y=ENSG00000229807)) + 
+  geom_boxplot(aes(colour = cell_type)) +
+  theme_minimal() + 
+  ggtitle("Smart-seq2 data, XIST Expression") +
+  scale_x_discrete(limits = order_s) +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none")
+dev.off()
+
+xist <- assay(sce.10X.vg.qc, "logcounts")["ENSG00000229807",]
+cell_types <- colData(sce.10X.vg.qc)$cell_type
+result <- pairwise.wilcox.test(xist, cell_types, p.adjust.method = "bonferroni")
+
+p_values <- result$p.value
+p_values_long <- melt(p_values, varnames = c("Cell_type_1", "Cell_type_2"), value.name = "p_value")
+p_values_long_significant <- p_values_long[p_values_long$p_value < 0.05, ]
+p_values_long_significant <- na.omit(p_values_long_significant)
+
+pdf("heatmap_xist.pdf")
+ggplot(p_values_long_significant, aes(x = Cell_type_1, y = Cell_type_2, fill = p_value)) +
+  geom_tile() +
+  scale_fill_gradient(low = "red", high = "white") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Xist significant differences, 10x Genomics", fill = "Valor p")
+dev.off()
+
+xist <- assay(sce.smart2.vg.qc, "logcounts")["ENSG00000229807",]
+cell_types <- colData(sce.smart2.vg.qc)$cell_type
+result <- pairwise.wilcox.test(xist, cell_types, p.adjust.method = "bonferroni")
+
+p_values <- result$p.value
+p_values_long <- melt(p_values, varnames = c("Cell_type_1", "Cell_type_2"), value.name = "p_value")
+p_values_long_significant <- p_values_long[p_values_long$p_value < 0.05, ]
+p_values_long_significant <- na.omit(p_values_long_significant)
+
+pdf("xist_smart2.pdf")
+ggplot(p_values_long_significant, aes(x = Cell_type_1, y = Cell_type_2, fill = p_value)) +
+  geom_tile() +
+  scale_fill_gradient(low = "red", high = "white") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Xist significant differences, Smart-seq2", fill = "Valor p")
+dev.off()
+
+#SiXGD
+excel <- read_excel("GenesEscapeXCI.xlsx", skip=1)
+excel$Gene.ID <- sub("\\..*", "", excel$Gene.ID)
+
+inactive <- excel$Gene.ID[excel$Combined.XCI.status=="inactive"]
+escape <- excel$Gene.ID[excel$Combined.XCI.status=="escape"]
+
+ina <- intersect(rownames(sce.10X.vg.qc), inactive)
+esc <- intersect(rownames(sce.10X.vg.qc), escape)
+
+esc <- esc[esc !="ENSG00000229807"]
+
+mean_ina <- colMeans(assays(sce.10X.vg.qc)$logcounts[ina, ], na.rm=TRUE)
+mean_esc <- colMeans(assays(sce.10X.vg.qc)$logcounts[esc, ], na.rm=TRUE)
+
+colData(sce.10X.vg.qc)$inactive_vs_escape <- log2(mean_ina / mean_esc)
+colData(sce.10X.vg.qc)$mean_inactive <- mean_ina
+colData(sce.10X.vg.qc)$mean_escape <- mean_esc
+
+cell_counts <- table(colData(sce.10X.vg.qc)$cell_type)
+cell_types_10X <- names(cell_counts[cell_counts > 1])
+mean_cells <- c()
+for (cell in cell_types_10X){
+  cells <- which(sce.10X.vg.qc$cell_type == cell & sce.10X.vg.qc$inactive_vs_escape != Inf)
+  mean_cells <- c(mean_cells, median(colData(sce.10X.vg.qc[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+mean_cells <- data.frame(
+  celula = cell_types_10X,
+  valor = mean_cells)
+
+mean_cells_ordenado <- mean_cells[order(mean_cells$valor), ]
+
+order <- mean_cells_ordenado$celula
+
+pdf("SiXGD_10xGenomics.pdf")
+ggcells(sce.10X.vg.qc, mapping = aes(x = cell_type, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=cell_type)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  coord_cartesian(ylim = c(0,1.5)) +
+  labs(title = "Gene expression per cell type", subtitle = "Sequencing technique: 10x Genomics", x = "Cell types", 
+       y = "Proportion of silenced/escaped")
+dev.off()
+
+ina <- intersect(rownames(sce.smart2.vg.qc), inactive)
+esc <- intersect(rownames(sce.smart2.vg.qc), escape)
+
+esc <- esc[esc !="ENSG00000229807"]   #quitamos xist!
+
+mean_ina <- colMeans(assays(sce.smart2.vg.qc)$logcounts[ina, ], na.rm=TRUE)
+mean_esc <- colMeans(assays(sce.smart2.vg.qc)$logcounts[esc, ], na.rm=TRUE)
+
+colData(sce.smart2.vg.qc)$inactive_vs_escape <- log2(mean_ina / mean_esc)
+colData(sce.smart2.vg.qc)$mean_inactive <- mean_ina
+colData(sce.smart2.vg.qc)$mean_escape <- mean_esc
+
+cell_counts <- table(colData(sce.smart2.vg.qc)$cell_type)
+cell_types_smart2 <- names(cell_counts[cell_counts > 1])
+mean_cells <- c()
+for (cell in cell_types_smart2){
+  cells <- which(sce.smart2.vg.qc$cell_type == cell & sce.smart2.vg.qc$inactive_vs_escape != Inf)
+  mean_cells <- c(mean_cells, median(colData(sce.smart2.vg.qc[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+df <- data.frame(
+  celula = cell_types_smart2,
+  mean = mean_cells
+)
+
+df_ordered <- df[order(df$mean), ]
+order <- df_ordered$celula
+
+pdf("SiXGD_smart2.pdf")
+ggcells(sce.smart2.vg.qc, mapping = aes(x = cell_type, y = inactive_vs_escape)) +
+  geom_boxplot(aes(fill=cell_type)) +
+  ylim(c(0, 10)) +
+  theme_minimal() + 
+  scale_x_discrete(limits = order) +
+  coord_cartesian(ylim = c(0,3)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.y = element_text(size = 11),
+        axis.title.x = element_text(size = 11),
+        legend.position = "none") + 
+  labs(title = "Gene expression per cell type", subtitle = "Sequencing technique: Smart-Seq2", x = "Cell types", 
+       y = "Proportion of silenced/escaped")
+dev.off()
+
+#SiXGD correlation 
+
+#10X median
+cell_counts <- table(colData(sce.10X.qc.mothers.qc)$cell_type)
+cell_types <- names(cell_counts[cell_counts > 1])
+median_cells <- c()
+for (cell in cell_types){
+  cells <- which(sce.10X.qc.mothers.qc$cell_type == cell)
+  median_cells <- c(median_cells, median(colData(sce.10X.qc.mothers.qc[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+#smart2 median
+cell_counts <- table(colData(sce.smart2.vg.qc)$cell_type)
+cell_types_smart2 <- names(cell_counts[cell_counts > 1])
+median_cells_smart2 <- c()
+for (cell in cell_types_smart2){
+  cells <- which(sce.smart2.vg.qc$cell_type == cell)
+  median_cells_smart2 <- c(median_cells_smart2, median(colData(sce.smart2.vg.qc[, cells])$inactive_vs_escape, na.rm=TRUE))
+}
+
+# final dataframe
+df <- data.frame(
+  cell_type = cell_types,
+  tenX = median_cells,
+  smart2 = median_cells_smart2
+)
+
+#plot
+pdf("comparative.pdf")
+cor.test(median_cells, median_cells_smart2)
+ggplot(df, aes(x = smart2, y = tenX, color = cell_type)) +
+  geom_point(size = 2) +
+  geom_smooth(method=lm, col = "red", linewidth = 0.5, se = FALSE)+
+  geom_text(aes(label = cell_type), hjust = 0, vjust = 1.8, size = 3, colour = "black") +
+  xlim(0.8, 1.55) +
+  theme_minimal() + 
+  theme(legend.position = "none") +
+  labs(title = "Median of silenced/escaped proportion per cell type", 
+       subtitle = "Correlation between techniques", 
+       x = "Smart-Seq2", y = "10X Genomics")
+dev.off()
